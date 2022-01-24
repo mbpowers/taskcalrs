@@ -1,0 +1,562 @@
+use std::io::{stdin, stdout, Write, Error, BufReader, BufRead};
+use std::str::FromStr;
+use std::fs::File;
+use std::fmt::Display;
+use termion::event::Key;
+use termion::raw::IntoRawMode;
+use termion::input::TermRead;
+use tui::Terminal;
+use tui::text::{ Spans, Span };
+use tui::style::{ Color, Style, Modifier};
+use tui::backend::TermionBackend;
+use tui::widgets::*;
+use tui::layout::{Layout, Rect, Constraint, Direction, Alignment};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, NaiveDateTime};
+// use num_traits::cast::FromPrimitive;
+
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>())
+}
+
+// impl Display for Mode {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         match &self {
+//             Mode::Tasks => write!(f, "Tasks"),
+//             Mode::Schedule => write!(f, "Schedule"),
+//             Mode::Calendar => write!(f, "Calendar"),
+//         }
+//     }
+// }
+
+struct ModeSelection { mode: String, leader: Key }
+impl ModeSelection {
+    fn new(mode: String, leader: Key) -> ModeSelection{ ModeSelection{ mode, leader } }
+    fn next(&mut self) { match &*self.mode {
+            "Calendar" => self.mode = "Tasks".to_string(),
+            "Tasks" => self.mode = "Schedule".to_string(),
+            "Schedule" => self.mode = "Calendar".to_string(),
+            &_ => (),
+    } }
+    fn prev(&mut self) { match &*self.mode {
+            "Tasks" => self.mode = "Calendar".to_string(),
+            "Schedule" => self.mode = "Tasks".to_string(),
+            "Calendar" => self.mode = "Schedule".to_string(),
+            &_ => (),
+    } }
+}
+
+struct TaskSelection { items: Vec<String>, state: ListState }
+impl TaskSelection {
+    fn new(items: Vec<String>) -> TaskSelection { TaskSelection { items, state: ListState::default(), } }
+    pub fn set_items(&mut self, items: Vec<String>) { self.items = items; self.state = ListState::default(); }
+    pub fn unselect(&mut self) { self.state.select(None); }
+    pub fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i >= self.items.len() - 1 { 0 } else { i + 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+    pub fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i == 0 { self.items.len() - 1 } else { i - 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+}
+
+struct SchedSelection { items: Vec<String>, state: ListState }
+impl SchedSelection {
+    fn new(items: Vec<String>) -> SchedSelection { SchedSelection { items, state: ListState::default(), } }
+    pub fn set_items(&mut self, items: Vec<String>) { self.items = items; self.state = ListState::default(); }
+    pub fn unselect(&mut self) { self.state.select(None); }
+    pub fn select(&mut self, i: usize) { self.state.select(Some(i)); }
+    pub fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i >= self.items.len() - 1 { 0 } else { i + 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+    pub fn prev(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i == 0 { self.items.len() - 1 } else { i - 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+}
+
+struct DateSelection { selected: bool, date: NaiveDate, time: NaiveTime }
+impl Display for DateSelection { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.date.to_string()) } }
+impl DateSelection {
+    fn date(date: NaiveDate) -> DateSelection { DateSelection { selected: false, date, time: NaiveTime::from_hms(0,0,0)} }
+    fn datetime(date: NaiveDate, time: NaiveTime) -> DateSelection { DateSelection { selected: false, date, time } }
+    // fn clone(&self) -> DateSelection { DateSelection { selected: self.selected, date: self.date } }
+    fn set_date(&mut self, date: NaiveDate) { self.date = date }
+    fn set_time(&mut self, time: NaiveTime) { self.time = time }
+
+    fn prev_year(&mut self) {
+        self.date = if self.is_leap_day() {
+            NaiveDate::from_ymd(self.year()-1, self.month(), 28)
+        } else { self.date.with_year(self.year()-1).unwrap() }
+    }
+    fn next_year(&mut self) {
+        self.date = if self.is_leap_day() {
+            NaiveDate::from_ymd(self.year()+1, self.month(), 28)
+        } else { self.date.with_year(self.year()+1).unwrap() }
+    }
+    fn prev_month(&mut self) {
+        let day = self.day(); let mut month = self.month(); let mut year = self.year();
+        if month == 1 { year -= 1; month = 12 } else { month -= 1 }
+        self.date = NaiveDate::from_ymd(year, month, 1);
+        self.date = if day > self.month_length() { self.date.with_day(self.month_length()).unwrap() } else { self.date.with_day(day).unwrap() }
+    }
+    fn next_month(&mut self) {
+        let day = self.day(); let mut month = self.month(); let mut year = self.year();
+        if month == 12 { year += 1; month = 1 } else { month += 1 }
+        self.date = NaiveDate::from_ymd(year, month, 1);
+        self.date = if day > self.month_length() { self.date.with_day(self.month_length()).unwrap() } else { self.date.with_day(day).unwrap() }
+    }
+    fn prev_week(&mut self) { self.date = self.date.pred().pred().pred().pred().pred().pred().pred() }
+    fn next_week(&mut self) { self.date = self.date.succ().succ().succ().succ().succ().succ().succ() }
+    fn prev_day(&mut self) { self.date = self.date.pred() }
+    fn next_day(&mut self) { self.date = self.date.succ() }
+    fn prev_hour(&mut self) {
+        if self.hour() > 0 { self.time = NaiveTime::from_hms(self.hour()-1, self.minute(), self.second()) }
+        else { self.time = NaiveTime::from_hms(23, self.minute(), self.second()); self.prev_day() }}
+    fn next_hour(&mut self) {
+        if self.hour() < 23 { self.time = NaiveTime::from_hms(self.hour()+1, self.minute(), self.second()) }
+        else { self.time = NaiveTime::from_hms(0, self.minute(), self.second()); self.next_day() }}
+
+    fn second(&self) -> u32 { return self.time.format("%S").to_string().parse::<u32>().unwrap() }
+    fn minute(&self) -> u32 { return self.time.format("%M").to_string().parse::<u32>().unwrap() }
+    fn hour(&self) -> u32 { return self.time.format("%H").to_string().parse::<u32>().unwrap() }
+    fn day(&self) -> u32 { return self.date.day() }
+    fn month(&self) -> u32 { return self.date.month() }
+    fn year(&self) -> i32 { return self.date.year() }
+
+    fn first(&self) -> NaiveDate { return NaiveDate::from_ymd(self.year(), self.month(), 1) }
+    // fn weeks(&self) -> u32 { return week_diff(self.date) }
+    fn month_length(&self) -> u32 {
+        let year = self.year();
+        match self.month() {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 =>  return 31,
+            4 | 6 | 9 | 11 => return 30,
+            2 => if year % 4 == 0 && ( year % 400 == 0 || year % 100 != 0 ) { return 29 } else { return 28 }
+            _ => 0
+        }
+    }
+    fn month_string(&self) -> String {
+        return match self.month() {
+            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+            5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+            9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+            _ => "",
+        }.to_string()
+    }
+    fn is_leap_year(&self) -> bool {
+        let year = self.year();
+        year % 4 == 0 && (year % 400 == 0 || year % 100 != 0)
+    }
+    fn is_leap_day(&self) -> bool { self.is_leap_year() && self.day() == 29 && self.month() == 2 }
+
+    fn select(&mut self) { self.selected = true }
+    fn deselect(&mut self) { self.selected = false }
+    fn toggle(&mut self) { self.selected = !self.selected }
+
+    // fn index_of(&self) -> u8 { month_in_days(pmonth(self.date))-7-self.first().weekday().num_days_from_sunday() as u8 + self.day() }
+}
+
+#[derive(Debug, PartialEq)]
+enum Cycle { Never, Daily, Weekly, Monthly, Yearly }
+impl FromStr for Cycle {
+    type Err = ();
+    fn from_str(input: &str) -> Result<Cycle, Self::Err> {
+        match input {
+            "N" => Ok(Cycle::Never),
+            "D"  => Ok(Cycle::Daily),
+            "W"  => Ok(Cycle::Weekly),
+            "M"  => Ok(Cycle::Monthly),
+            "Y" => Ok(Cycle::Yearly),
+            _      => Err(()),
+        }
+    }
+}
+impl Cycle {  }
+struct Event { name: String, time: NaiveTime, date: NaiveDate, duration: u8, repeat_cycle: Cycle, repeat_occurences: u8}
+impl Event {
+    fn new(name: String, time: NaiveTime, date: NaiveDate, duration: u8, repeat_cycle: Cycle, repeat_occurences: u8) -> Event {
+        Event{name, time, date, duration, repeat_cycle, repeat_occurences}
+    }
+    fn from_str(str: String) -> Event {
+        let substr: Vec<String> = str.split_whitespace().map(|s| s.to_string()).collect();
+        let date = NaiveDate::from_ymd(substr[0].parse::<i32>().unwrap(), substr[1].parse::<u32>().unwrap(), substr[2].parse::<u32>().unwrap());
+        let time = NaiveTime::from_hms(substr[3].parse::<u32>().unwrap(), 0, 0);
+        let duration = substr[4].parse::<u8>().unwrap();
+        let repeat_cycle = Cycle::from_str(&substr[5]).unwrap();
+        let repeat_occurences = substr[6].as_bytes().iter().fold(0, |acc, &b| acc*2 + b - 48 as u8);
+        // println!("{}", format!("{:08b}", repeat_occurences));
+        let name = &substr[7];
+        Event{name: name.to_string(), time, date, duration, repeat_cycle, repeat_occurences}
+    }
+}
+
+fn main() -> Result<(), Error> {
+    let stdin = stdin();
+    let mut stdout = stdout().into_raw_mode()?;
+    write!(
+        stdout,
+        "{}{}",
+        termion::cursor::Goto(1, 1),
+        termion::clear::All
+    )
+   .unwrap();
+    let backend = TermionBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // let path = "lines.txt";
+    // let mut output = File::create(path)?;
+    // write!(output, "Rust\n💖\nFun")?;
+    // let input = File::open(path)?;
+    // let buffered = BufReader::new(input);
+    // for line in buffered.lines() {
+    //     println!("{}", line?);
+    // }
+    let mut sched_list: Vec<Event> = Vec::new();
+    let file = File::open("schedule")?;
+    for line_result in BufReader::new(file).lines() {
+        let line = line_result.unwrap();
+        if !line.starts_with("#") && line.len() > 0 { sched_list.push(Event::from_str(line)); }
+    }
+
+
+    // Instantiate Variables
+    let mut show_keys = false;
+    let today = Local::today().naive_local();
+    let time = Local::now().time();
+    // let time = NaiveTime::from_hms(23,0,0);
+    let mut date_selection = DateSelection::datetime(today, time);
+    let mut mode_selection = ModeSelection::new("Calendar".to_string(), Key::Null);
+    // let mut sched_selection = SchedSelection::new((date_selection.hour()..date_selection.hour()+24).collect::<Vec<u32>>().iter().map( |&id| (id%24).to_string() + "\n ").collect());
+    // sched_selection.select(23 as usize);
+    // sched_selection.select(date_selection.hour() as usize);
+    let mut task_selection = TaskSelection::new(vec![
+        String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+    ]);
+
+    for c in stdin.keys() {
+        let x = c.unwrap();
+        match mode_selection.mode.as_str() {
+            "Tasks" => match x {
+                Key::Char('j') => task_selection.next(),
+                Key::Char('k') => task_selection.previous(),
+                Key::Char('\t') => task_selection.unselect(),
+                _ => (),
+            }
+            "Schedule" => {
+                match mode_selection.leader {
+                    Key::Char('g') => { match x {
+                        Key::Char('h') => {date_selection.set_time(time); date_selection.set_date(today)},
+                        Key::Char('0') => date_selection.set_time(NaiveTime::from_hms(0, 0, 0)),
+                        _ => (),
+                    } mode_selection.leader = Key::Null; }
+                    Key::Null => match x {
+                        Key::Char(' ') => date_selection.toggle(),
+                        Key::Char('j') => {date_selection.next_hour()},
+                        Key::Char('k') => {date_selection.prev_hour()},
+                        // Key::Char('j') => {date_selection.next_hour(); sched_selection.next()},
+                        // Key::Char('k') => {date_selection.prev_hour(); sched_selection.prev()},
+                        Key::Char('l') => date_selection.next_day(),
+                        Key::Char('h') => date_selection.prev_day(),
+                        Key::Char('g') => mode_selection.leader = Key::Char('g'),
+                        _ => (),
+                    }
+                    _ => (),
+                }
+            }
+            "Calendar" => {
+                match mode_selection.leader {
+                    Key::Char('g') => { match x {
+                        Key::Char('h') => date_selection.set_date(today),
+                        Key::Char('0') => date_selection.set_date(NaiveDate::from_ymd(date_selection.year(),1,1)),
+                        _ => (),
+                    } mode_selection.leader = Key::Null; }
+                    Key::Null => match x {
+                        Key::Char(' ') => date_selection.toggle(),
+                        Key::Char('t') => date_selection.set_date(Local::today().naive_local()),
+                        Key::Char('L') => date_selection.next_year(),
+                        Key::Char('H') => date_selection.prev_year(),
+                        Key::Char('J') => date_selection.next_month(),
+                        Key::Char('K') => date_selection.prev_month(),
+                        Key::Char('j') => date_selection.next_week(),
+                        Key::Char('k') => date_selection.prev_week(),
+                        Key::Char('l') => date_selection.next_day(),
+                        Key::Char('h') => date_selection.prev_day(),
+                        Key::Char('a') => task_selection.items.push(date_selection.date.to_string()),
+                        Key::Char('p') => task_selection.items.push(date_selection.day().to_string()),
+                        Key::Char('g') => mode_selection.leader = Key::Char('g'),
+                        _ => (),
+                    }
+                    _ => (),
+                }
+            }
+            &_ => (),
+        }
+        match x {
+            Key::Char('q') => break,
+            Key::Char('\t') => mode_selection.next(),
+            Key::BackTab => mode_selection.prev(),
+            Key::Char('?') => show_keys = !show_keys,
+            _ => (),
+        }
+        terminal.draw(|f| {
+            let rects = create_rects(f.size(), show_keys);
+
+            // Task List
+            let list_items: Vec<ListItem> = task_selection.items.iter().map(|i| ListItem::new(i.as_ref())).collect();
+            let task_list = List::new(list_items).block(Block::default()
+                .title(Spans::from(vec![ Span::styled("Tasks", Style::default().fg(Color::Blue)), ]))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(if mode_selection.mode == "Tasks".to_string() {Color::Red} else {Color::White}))
+                .borders(Borders::ALL)
+            ).highlight_style(Style::default().fg( Color::Blue ));
+            f.render_stateful_widget(task_list, rects[0], &mut task_selection.state);
+
+
+            // Calendar
+            let cal_title = date_selection.month_string()+" "+&date_selection.day().to_string()+" "+&date_selection.date.year().to_string();
+            let calendar = Block::default()
+                .title(Spans::from(vec![ Span::styled(cal_title, Style::default().fg(Color::Blue)), ]))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg( if mode_selection.mode == "Calendar".to_string() {Color::Red} else {Color::White}))
+                .borders(Borders::ALL);
+            let date_nums = create_dates(&date_selection);
+            let mut dates = Vec::new();
+            let cal_rects = create_cal_rects(calendar.inner(rects[1]), show_keys);
+            for (i, (rect, date)) in cal_rects.clone().into_iter().zip(date_nums.iter()).enumerate() {
+                dates.push((
+                    Block::default()
+                        .title(
+                            Span::styled(
+                                if i < 7 { date.weekday().to_string() }
+                                else { format!("{: ^4}", format!("{: >2}", date.day().to_string())) },
+                                Style::default().fg(
+                                    if i < 7 { Color::Blue }
+                                    else if date.month() == date_selection.month().into() { Color::White }
+                                    else { Color::Red }
+                                ).bg(
+                                    if date == &today { Color::Red }
+                                    else if date == &date_selection.date && date_selection.selected { Color::Yellow }
+                                    else { Color::Reset }
+                                )
+                            )
+                        ),
+                rect));
+            }
+            f.render_widget(calendar, rects[1]);
+            for date in dates { f.render_widget(date.0, date.1); }
+            if show_keys {
+                f.render_widget(
+                    Paragraph::new("H-L:yr J-K:mn h-l:wk j-k:dy")
+                    .block(Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg( if mode_selection.mode == "Calendar".to_string() {Color::Red} else {Color::White}))
+                ), cal_rects[cal_rects.len()-1]); }
+
+
+            // Schedule
+            // Outer Block
+            let schedule = Block::default()
+                .title(Spans::from(vec![ Span::styled("Schedule", Style::default().fg(Color::Blue)), ]))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg( if mode_selection.mode == "Schedule".to_string() {Color::Red} else {Color::White}))
+                .borders(Borders::ALL);
+            // let colors = [Color::Red, Color::Yellow, Color::Green, Color::Cyan, Color::LightBlue, Color::Blue, Color::Magenta];
+
+            // Inner Block
+            let sched_rects = create_sched_rects(schedule.inner(rects[2]), show_keys);
+            let left_rects = sched_rects.0;
+            let right_rects = sched_rects.1;
+            // let sched_rects = create_sched_rects(rects[2], show_keys);
+            for (i, rect) in left_rects.iter().enumerate() {
+                // let widget = Block::default()
+                //     // .title(Spans::from(vec![ Span::styled("Schedule", Style::default().fg(Color::Blue)), ]))
+                //     // .border_style(Style::default().fg( if mode_selection.mode == "Schedule".to_string() {Color::Red} else {Color::White}))
+                //     // .title_alignment(Alignment::Center)
+                //     .style(Style::default().bg(if date_selection.hour() == i.try_into().unwrap() { Color::DarkGray } else { Color::Reset }))
+                //     .title(Spans::from(vec![ Span::styled(format!("{: >2}", (i+1).to_string()), Style::default().fg(Color::Blue)), ]));
+                //     // .borders(Borders::ALL);
+                if show_keys && i == left_rects.len()-1 {
+                    f.render_widget(
+                        Paragraph::new("H-L:mn J-K:wk h-l:dy j-k:hr")
+                        .block(Block::default()
+                            .borders(Borders::TOP)
+                            .border_style(Style::default().fg( if mode_selection.mode == "Schedule".to_string() {Color::Red} else {Color::White}))
+                    ), left_rects[left_rects.len()-1]);
+                } else {
+                    let hour = (date_selection.hour()+i as u32)%24;
+                    // println!("{}, {}", time.format("%H").to_string(), format!("{:0>2}", hour.to_string()));
+                    let widget = Paragraph::new(format!("{: >2}", hour.to_string()))
+                        .block(Block::default()
+                               .style(Style::default()
+                                    .bg(
+                                        if time.format("%H").to_string() == format!("{:0>2}", hour.to_string()) {
+                                            if date_selection.date == today.pred() && (date_selection.hour()+i as u32) >= 24 {Color::Red}
+                                            else if date_selection.date == today && (date_selection.hour()+i as u32) < 24 {Color::Red}
+                                            else {Color::Reset}
+                                        }
+                                        else if hour%2==0 {Color::Black}
+                                        else {Color::Reset})));
+                    f.render_widget(widget, *rect);
+                }
+            }
+            task_selection.set_items(vec![]);
+            let colors = [Color::Red, Color::Yellow, Color::Green, Color::Cyan, Color::LightBlue, Color::Blue, Color::Magenta];
+            for (c, event) in sched_list.iter().enumerate() {
+                for (i, rect) in right_rects.iter().enumerate() {
+                    let hour = (date_selection.hour()+i as u32)%24;
+                    match event.repeat_cycle {
+                        Cycle::Never => {
+                            if date_selection.date == event.date {
+                                if format!("{:0>2}", hour.to_string()) == event.time.format("%H").to_string() {
+                                    let widget = Paragraph::new(event.name.clone())
+                                        .block(Block::default()
+                                            .style(Style::default()
+                                                .bg(colors[c])));
+                                    f.render_widget(widget, *rect);
+                                } else if hour < event.time.format("%H").to_string().parse::<u32>().unwrap() + event.duration as u32
+                                    && hour >= event.time.format("%H").to_string().parse::<u32>().unwrap() {
+                                    let widget = Paragraph::new("")
+                                        .block(Block::default()
+                                            .style(Style::default()
+                                                .bg(colors[c])));
+                                    f.render_widget(widget, *rect);
+                                }
+                            }
+                        }
+                        Cycle::Daily => {
+                            task_selection.items.push(event.time.format("%H").to_string());
+                            if format!("{:0>2}", hour.to_string()) == event.time.format("%H").to_string() {
+                                let widget = Paragraph::new(event.name.clone())
+                                    .block(Block::default()
+                                        .style(Style::default()
+                                            .bg(colors[c])));
+                                f.render_widget(widget, *rect);
+                            } else if hour < (event.time.format("%H").to_string().parse::<u32>().unwrap() + event.duration as u32) %24
+                                && hour >= event.time.format("%H").to_string().parse::<u32>().unwrap() {
+                                let widget = Paragraph::new("")
+                                    .block(Block::default()
+                                        .style(Style::default()
+                                            .bg(colors[c])));
+                                f.render_widget(widget, *rect);
+                            }
+                        },
+                        Cycle::Weekly => {
+                            // println!("Dingus");
+                            if ("1".to_string() + &"0".repeat((6-date_selection.date.weekday().num_days_from_sunday()) as usize)).as_bytes().iter().fold(0, |acc, &b| acc*2 + b - 48 as u8) & event.repeat_occurences != 0 {
+                                // println!("Dangus");
+                                if format!("{:0>2}", hour.to_string()) == event.time.format("%H").to_string() {
+                                    let widget = Paragraph::new(event.name.clone())
+                                        .block(Block::default()
+                                            .style(Style::default()
+                                                .bg(colors[c])));
+                                    f.render_widget(widget, *rect);
+                                } else if hour < event.time.format("%H").to_string().parse::<u32>().unwrap() + event.duration as u32
+                                    && hour >= event.time.format("%H").to_string().parse::<u32>().unwrap() {
+                                    let widget = Paragraph::new("")
+                                        .block(Block::default()
+                                            .style(Style::default()
+                                                .bg(colors[c])));
+                                    f.render_widget(widget, *rect);
+                                }
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            f.render_widget(schedule, rects[2]);
+
+            // let sched_items: Vec<ListItem> = sched_selection.items.iter().map(|i| ListItem::new(i.as_ref())).collect();
+            // let sched_list = List::new(sched_items).block(Block::default()
+            //     .title(Spans::from(vec![ Span::styled("Schedule", Style::default().fg(Color::Blue)) ]))
+            //     .title_alignment(Alignment::Center)
+            //     .border_style(Style::default().fg(if mode_selection.mode == "Schedule".to_string() {Color::Red} else {Color::White}))
+            //     .borders(Borders::ALL)
+            // ).highlight_style(Style::default().fg( Color::Blue ));
+            // f.render_stateful_widget(sched_list, rects[2], &mut sched_selection.state);
+        })?;
+    }
+    Ok(())
+}
+
+fn create_cal_rects(size: Rect, show_keys: bool) -> Vec<Rect> {
+    let rows: usize = 7 + show_keys as usize;
+    let init_rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints( vec![ Constraint::Length(1); rows ].as_ref())
+        .split(size);
+    let mut rects: Vec<Rect> = Vec::new();
+    for (i, rect) in init_rects.iter().enumerate() {
+        if show_keys && i == init_rects.len()-1 { rects.push(*rect) }
+        else{
+            rects.extend(Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints( [ Constraint::Length(4); 7 ].as_ref())
+                .split(*rect));
+        }
+    }
+    rects
+}
+
+fn create_sched_rects(size: Rect, show_keys: bool) -> (Vec<Rect>, Vec<Rect>) {
+    // let rows: usize = ()(size.height/2) + show_keys as usize;
+    let constraints = vec![ Constraint::Length(2); (size.height/2).into() ];
+    let init_rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints( constraints.as_ref())
+        .split(size);
+    let mut left_rects: Vec<Rect> = Vec::new();
+    let mut right_rects: Vec<Rect> = Vec::new();
+    for (i, rect) in init_rects.iter().enumerate() {
+        if show_keys && i == init_rects.len()-1 { left_rects.push(*rect) }
+        else{
+            let rects = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints( [ Constraint::Length(3), Constraint::Min(3) ].as_ref())
+                .split(*rect);
+            left_rects.push(rects[0]);
+            right_rects.push(rects[1]);
+        }
+    }
+    (left_rects, right_rects)
+}
+
+fn create_rects(size: Rect, show_keys: bool) -> Vec<Rect> {
+    let mut rects = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints( [ Constraint::Length(30), Constraint::Min(30), ].as_ref())
+        .split(size);
+
+    let subrects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints( [ Constraint::Length(9+2*show_keys as u16), Constraint::Min(30), ].as_ref())
+        .split(rects.remove(0));
+    rects.extend(subrects);
+    rects
+}
+
+fn create_dates(sel_date: &DateSelection) -> Vec<NaiveDate> {
+    let mut prev_month = DateSelection::date(sel_date.date); prev_month.prev_month();
+    let curr_month = DateSelection::date(sel_date.date);
+    let mut next_month = DateSelection::date(sel_date.date); next_month.next_month();
+
+    let mut dates: Vec<NaiveDate> = Vec::new();
+    for date in prev_month.month_length()-curr_month.first().weekday().num_days_from_sunday()-7..prev_month.month_length() { dates.push(NaiveDate::from_ymd(prev_month.year(), prev_month.month(), (date+1).into()))};
+    for date in 0..curr_month.month_length() { dates.push(NaiveDate::from_ymd(curr_month.year(), curr_month.month(), (date+1).into())) };
+    let offset = if dates.len() < 42 { 14 } else { 7 };
+    for date in 0..offset-next_month.first().weekday().num_days_from_sunday() { dates.push(NaiveDate::from_ymd(next_month.year(), next_month.month(), (date+1).into()))};
+    return dates
+}

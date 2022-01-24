@@ -1,0 +1,17 @@
+# Examples
+# Magenta  1 1 1     16   2   W   00111110 Weekdays proj:tag:tag
+# Yellow   1 1 1     16   2   W   01000001 Weekends none
+# Cyan     2022 1 20 16   9   N   11000001 One-Time none
+# Blue      1 1 1     22   4   D   0        Test     nvim
+
+# color   date      time dur cyc occ      name     mods
+Black     1 1 1     2    8   D   0         Sleep    sleep
+Red       1 1 1     10   1   D   0         Wake-Up  wake
+Blue      1 1 1     11   3   W   00111110  Code     :code
+Red       1 1 1     13   1   D   0         Lunch    none
+Blue      1 1 1     14   5   W   00111110  Code     :code
+Red       1 1 1     19   1   D   0         Dinner   none
+Black     1 1 1     20   1   D   0         Chill    :chill
+Magenta   1 1 1     21   2   D   01010010  Lift     lift:gym
+Magenta   1 1 1     21   2   D   10101001  Cardio   cardio:gym
+DarkGray  1 1 1     23   3   D   0         Chill    none

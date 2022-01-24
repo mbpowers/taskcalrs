@@ -1,0 +1,467 @@
+use std::io::{stdin, stdout, Write, Error};
+use std::fmt::{ Display };
+use std::slice::Iter;
+use termion::event::Key;
+use termion::raw::IntoRawMode;
+use termion::input::TermRead;
+use tui::Terminal;
+use tui::text::{ Spans, Span };
+use tui::style::{ Color, Style, Modifier};
+use tui::backend::TermionBackend;
+use tui::widgets::*;
+use tui::layout::{Layout, Rect, Constraint, Direction, Alignment};
+use chrono::{TimeZone, Weekday, Date, Datelike, Local, NaiveDate};
+// use num_traits::cast::FromPrimitive;
+
+#[derive(PartialEq)]
+enum Mode {
+    Tasks,
+    Appointments,
+    Calendar,
+}
+
+// enum Widgets<'a> {
+//     Widget(Box<dyn Widget>),
+//     List(List<'a>),
+// }
+
+impl Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            Mode::Tasks => write!(f, "Tasks"),
+            Mode::Appointments => write!(f, "Appointments"),
+            Mode::Calendar => write!(f, "Calendar"),
+        }
+    }
+}
+
+struct ModeSelection {
+    mode: Mode,
+}
+
+impl ModeSelection {
+    fn new(mode: Mode) -> ModeSelection{ ModeSelection{ mode } }
+    fn next(&mut self) { match self.mode{
+            Mode::Tasks => self.mode = Mode::Appointments,
+            Mode::Appointments => self.mode = Mode::Calendar,
+            Mode::Calendar=> self.mode = Mode::Tasks
+    } }
+    fn prev(&mut self) { match self.mode{
+            Mode::Tasks => self.mode = Mode::Calendar,
+            Mode::Appointments => self.mode = Mode::Tasks,
+            Mode::Calendar=> self.mode = Mode::Appointments
+    } }
+}
+
+// impl Mode {
+//     pub fn iterator() -> Iter<'static, Mode> {
+//         static MODES: [Mode; 3] = [Mode::Tasks, Mode::Appointments, Mode::Calendar];
+//         MODES.iter()
+//     }
+// }
+
+
+// struct TableSelection<'a> {
+//     items: Vec<Row<'a>>,
+//     state: TableState
+// }
+
+// impl TableSelection<'_> {
+//     fn new(items: Vec<Row<'static>>) -> TableSelection<'static> {
+//         TableSelection {
+//             items,
+//             state: TableState::default(),
+//         }
+//     }
+
+//     // pub fn set_items(&mut self, items: Vec<String>) {
+//     //     self.items = items;
+//     //     self.state = TableState::default();
+//     // }
+
+//     pub fn down(&mut self) {
+//         let i = match self.state.selected() {
+//             Some(i) => if i >= self.items.len() - 1 { 0 } else { i + 1 },
+//             None => 0,
+//         };
+//         self.state.select(Some(i));
+//     }
+
+//     pub fn up(&mut self) {
+//         let i = match self.state.selected() {
+//             Some(i) => if i == 0 { self.items.len() - 1 } else { i - 1 },
+//             None => 0,
+//         };
+//         self.state.select(Some(i));
+//     }
+
+//     pub fn unselect(&mut self) {
+//         self.state.select(None);
+//     }
+// }
+
+// Let's say we have some events to display.
+struct ListSelection { // `items` is the state managed by your application.
+    items: Vec<String>,
+    state: ListState
+}
+
+impl ListSelection {
+    fn new(items: Vec<String>) -> ListSelection {
+        ListSelection {
+            items,
+            state: ListState::default(),
+        }
+    }
+
+    pub fn set_items(&mut self, items: Vec<String>) {
+        self.items = items;
+        self.state = ListState::default();
+    }
+
+    pub fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i >= self.items.len() - 1 { 0 } else { i + 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => { if i == 0 { self.items.len() - 1 } else { i - 1 } }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    pub fn unselect(&mut self) {
+        self.state.select(None);
+    }
+}
+
+struct DateSelection {index: u8, month: NaiveDate}
+
+impl DateSelection {
+    fn new(index: u8, month: NaiveDate) -> DateSelection { DateSelection { index, month } }
+    fn up(&mut self) { if self.index > 13 && self.day() > 7 { self.index -= 7 } else {self.prev()} }
+    fn down(&mut self) { if self.index < 42 && self.day() < month_in_days(self.month)-7 { self.index += 7 } else {self.next()} }
+    fn left(&mut self) { if self.index > 7 { self.index -= 1 } }
+    fn right(&mut self) { if self.index < 48 { self.index += 1 } }
+    fn prev(&mut self) {
+        if self.month() == 1 { self.month = NaiveDate::from_ymd(self.month.year()-1, 12, 1)}
+        else { self.month = NaiveDate::from_ymd(self.month.year(), self.month.month() as u32-1, 1)};
+        self.index += week_diff(pmonth(self.month))*7}
+
+    fn next(&mut self) { if self.month.month() == 12 { self.month = NaiveDate::from_ymd(self.month.year()+1, 1, 1)} else { self.month = NaiveDate::from_ymd(self.month.year(), self.month.month() as u32+1, 1) } }
+    fn month(&self) -> u8 { return self.month.month() as u8}
+    fn day(&self) -> u8 { return self.index-(5+self.month.weekday().number_from_sunday() as u8) }
+    fn date(&self) -> NaiveDate { return NaiveDate::from_ymd(self.month.year(), self.month.month(), self.day() as u32) }
+    fn weeks(&self) -> u8 { return week_diff(self.month) }
+}
+
+fn main() -> Result<(), Error> {
+    let stdin = stdin();
+    let mut stdout = stdout().into_raw_mode()?;
+    write!(
+        stdout,
+        "{}{}",
+        termion::cursor::Goto(1, 1),
+        termion::clear::All
+    )
+   .unwrap();
+    let backend = TermionBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut mode_selection = ModeSelection::new(Mode::Tasks);
+    let mut list_selection = ListSelection::new(vec![
+        String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3"),
+        // String::from("Item 1"), String::from("Item 2"), String::from("Item 3"), String::from("Item 1"), String::from("Item 2"), String::from("Item 3")
+    ]);
+
+    // let mut table_selection = create_calendar(create_block("Calendar", &mode));
+    let temp = Local::today().naive_local();
+    let mut date_selection = DateSelection::new(temp.day() as u8, NaiveDate::from_ymd(temp.year(), temp.month(), 1));
+
+    for c in stdin.keys() {
+        let x = c.unwrap();
+        match x {
+            Key::Char('q') => break,
+            Key::Char('\t') => mode_selection.next(),
+            Key::BackTab => mode_selection.next(),
+            _ => (),
+        }
+        match mode_selection.mode {
+            Mode::Tasks => match x {
+                Key::Char('j') => list_selection.next(),
+                Key::Char('k') => list_selection.previous(),
+                _ => (),
+            }
+            Mode::Appointments => match x {
+                _ => (),
+            }
+            Mode::Calendar => match x {
+                Key::Char('j') => date_selection.down(),
+                Key::Char('k') => date_selection.up(),
+                Key::Char('l') => date_selection.right(),
+                Key::Char('h') => date_selection.left(),
+                Key::Char('a') => list_selection.items.push(date_selection.date().to_string()),
+                Key::Char('p') => list_selection.items.push(date_selection.day().to_string()),
+                _ => (),
+            }
+        }
+        terminal.draw(|f| {
+            let rects = create_rects(f.size());
+
+            // Task List
+            let list_items: Vec<ListItem> = list_selection.items.iter().map(|i| ListItem::new(i.as_ref())).collect();
+            let task_list = List::new(list_items).block(create_block("Tasks", &mode_selection.mode)).highlight_style(Style::default().fg( Color::Blue ));
+            f.render_stateful_widget(task_list, rects[0], &mut list_selection.state);
+
+            // // Calendar Table
+            // // let calendar_table = create_calendar(create_block("Calendar", &mode));
+            // // let block1 = create_block("Calendar", &mode);
+            // let table_items = table_selection.items.clone();
+            // // let mut date_rows: Vec<Row> = Vec::new();
+            // // for chunk in table_items.chunks(7) { date_rows.push(Row::new(chunk.to_vec())); }
+            // let calendar_table = Table::new(table_items)
+            //     .style(Style::default().fg(Color::White))
+            //     .header( Row::new(vec!["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])
+            //     .style(Style::default().fg(Color::Yellow))
+            // )
+            // .block(create_block("Calendar", &mode))
+            // .widths(&[Constraint::Length(4), Constraint::Length(4), Constraint::Length(4), Constraint::Length(4),
+            //     Constraint::Length(4), Constraint::Length(4), Constraint::Length(4)])
+            // .column_spacing(0) // necessary as default is 1
+            // .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Red));
+            // f.render_stateful_widget(calendar_table, rects[1], &mut table_selection.state);
+            let title = month_string(date_selection.month.month() as u8)+" "+&date_selection.month.year().to_string();
+            let calendar = Block::default()
+                .title(Spans::from(vec![ Span::styled(title, Style::default().fg(Color::Blue)), ]))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg( if mode_selection.mode == Mode::Calendar {Color::Red} else {Color::White}))
+                .borders(Borders::ALL);
+            // let colors = [Color::Red, Color::Yellow, Color::Green, Color::Cyan, Color::LightBlue, Color::Blue, Color::Magenta];
+            let date_nums = create_dates(date_selection.month);
+            let mut dates = Vec::new();
+            for (i, rect) in create_cal_rects(calendar.inner(rects[1])).iter().enumerate() {
+                dates.push(DateWidget::new(
+                    Block::default()
+                        .title(
+                            Span::styled(
+                                &date_nums[i],
+                                Style::default().fg(
+                                    if i < 7 {Color::Blue}
+                                    else if i == date_selection.index as usize {Color::Yellow}
+                                    else if i < 6+date_selection.month.weekday().number_from_sunday() as usize {Color::Red}
+                                    else if i > (33+7*(week_diff(date_selection.month)-4)+nmonth(date_selection.month).weekday().number_from_sunday() as u8) as usize {Color::Red}
+                                    // println!("Test"); println!("{:?}", week_diff(date_selection.month));
+                                    // else if date_nums[i] < 20 && i > 34 {Color::Red}
+                                    else {Color::White}
+                                    )))
+                        .borders(Borders::NONE),
+                    *rect));
+                //if i == date_selected { Color::Red } else { Color::White }
+                // cal_pars.push(Paragraph::new(".").block(create_block("1", &mode).borders(Borders::NONE)));
+            }
+            f.render_widget(calendar, rects[1]);
+            for date in dates {
+                f.render_widget(date.block, date.rect);
+            }
+
+            // Appointments
+            // let block2 = create_block("Appointments", &mode.mode);
+            let block2 = Block::default()
+                .title(Spans::from(vec![ Span::styled("Appointments", Style::default().fg(Color::Blue)), ]))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg( if mode_selection.mode == Mode::Appointments {Color::Red} else {Color::White}))
+                .borders(Borders::ALL);
+            f.render_widget(block2, rects[2]);
+        })?;
+    }
+    Ok(())
+}
+
+struct DateWidget<'a> {
+    block: Block<'a>,
+    rect: Rect
+}
+
+impl DateWidget<'_> {
+    fn new(block: Block, rect: Rect) -> DateWidget {
+        DateWidget { block, rect, }
+    }
+}
+
+fn create_cal_rects(size: Rect) -> Vec<Rect> {
+    let init_rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints( [ Constraint::Length(1); 7 ].as_ref())
+        .split(size);
+    let mut rects: Vec<Rect> = Vec::new();
+    for rect in init_rects {
+        rects.extend(Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints( [ Constraint::Length(4); 7 ].as_ref())
+            .split(rect));
+    }
+    rects
+}
+
+fn create_rects(size: Rect) -> Vec<Rect> {
+    let mut rects = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints( [ Constraint::Length(30), Constraint::Min(30), ].as_ref())
+        .split(size);
+
+    let subrects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints( [ Constraint::Length(9), Constraint::Min(30), ].as_ref())
+        .split(rects.remove(0));
+    rects.extend(subrects);
+    rects
+}
+
+
+fn create_block(title: &str, mode: &Mode) -> Block<'static> {
+    Block::default()
+        .title(Spans::from(vec![ Span::styled(title.to_string(), Style::default().fg(Color::Blue)), ]))
+        .title_alignment(Alignment::Center)
+        .border_style(Style::default().fg(if title == mode.to_string() {Color::Red} else {Color::White}))
+        .borders(Borders::ALL)
+}
+
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>())
+}
+
+fn nmonth(date: NaiveDate) -> NaiveDate {
+    let mut month = date.month();
+    let mut year = date.year();
+    assert!(month >= 1 && month <= 12);
+    if month == 12 { year += 1; month = 1 } else { month += 1 }
+    NaiveDate::from_ymd(year, month, 1)
+}
+
+fn pmonth(date: NaiveDate) -> NaiveDate {
+    let mut month = date.month();
+    let mut year = date.year();
+    assert!(month >= 1 && month <= 12);
+    if month == 1 { year -= 1; month = 12 } else { month -= 1 }
+    NaiveDate::from_ymd(year, month, 1)
+}
+
+
+fn create_dates(sel_date: NaiveDate) -> Vec<String> {
+    // Create vec of cells with date numbers and padded by empty cells
+    let prev_month = calendar_info(pmonth(sel_date));
+    let curr_month = calendar_info(sel_date);
+    let next_month = calendar_info(nmonth(sel_date));
+    let mut header: Vec<String> = vec!["Sun".to_string(), "Mon".to_string(), "Tue".to_string(), "Wed".to_string(), "Thu".to_string(), "Fri".to_string(), "Sat".to_string()];
+    let mut prev_dates: Vec<String> = Vec::new();
+    let mut curr_dates: Vec<String> = Vec::new();
+    let mut next_dates: Vec<String> = Vec::new();
+    for date in prev_month.length-curr_month.weekday.num_days_from_sunday() as i8..prev_month.length { prev_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string())))};
+    for date in 0..curr_month.length { curr_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string()))); }
+    header.extend(prev_dates);
+    header.extend(curr_dates);
+    let offset = if header.len() < 42 { 14 } else { 7 };
+    for date in 0..offset-next_month.weekday.num_days_from_sunday() { next_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string())))};
+    header.extend(next_dates);
+    // if header.len() < 49 { header.extend(vec!["".to_string(); 7]) } // padding
+    return header
+}
+
+fn week_diff(curr_month: NaiveDate) -> u8 {
+    let mut next_month = nmonth(curr_month);
+    next_month = NaiveDate::from_ymd(next_month.year(), next_month.month(), next_month.day()+1);
+    if curr_month.iso_week().week() < next_month.iso_week().week() { return (next_month.iso_week().week()-curr_month.iso_week().week()) as u8 }
+    else { return (52+next_month.iso_week().week()-curr_month.iso_week().week()) as u8 }
+}
+
+// fn create_dates(sel_date: NaiveDate) -> Vec<Vec<String>> {
+//     // Create vec of cells with date numbers and padded by empty cells
+//     let prev_month = calendar_info(sel_date);
+//     let curr_month = calendar_info(sel_date);
+//     let next_month = calendar_info(sel_date);
+//     let mut prev_dates: Vec<String> = Vec::new();
+//     let mut curr_dates: Vec<String> = Vec::new();
+//     let mut next_dates: Vec<String> = Vec::new();
+//     for date in prev_month.length-curr_month.weekday.num_days_from_sunday() as i8..prev_month.length { prev_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string())))};
+//     for date in 0..curr_month.length { curr_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string()))); }
+//     for date in 0..7-next_month.weekday.num_days_from_sunday() { next_dates.push(format!("{: ^4}",format!("{: >2}", (date+1).to_string())))};
+//     vec![prev_dates, curr_dates, next_dates]
+// }
+
+// fn create_calendar(block: Block<'static>) -> TableSelection {
+//     // Create vec of cells with date numbers and padded by empty cells
+//     let prev_month = calendar_info(12, 2021);
+//     let curr_month = calendar_info(1, 2022);
+//     let next_month = calendar_info(2, 2022);
+//     let mut date_cells: Vec<Cell> = Vec::new();
+//     for date in prev_month.length-curr_month.weekday.num_days_from_sunday() as i8..prev_month.length { date_cells.push(Cell::from(format!("{: ^4}",format!("{: >2}", (date+1).to_string()))).style(Style::default().fg(Color::Red)))};
+//     for date in 0..curr_month.length { date_cells.push(Cell::from(format!("{: ^4}",format!("{: >2}", (date+1).to_string())))); }
+//     for date in 0..7-next_month.weekday.num_days_from_sunday() { date_cells.push(Cell::from(format!("{: ^4}",format!("{: >2}", (date+1).to_string()))).style(Style::default().fg(Color::Red)))};
+
+//     // Split cell vec into rows of cells
+//     let mut date_rows: Vec<Row> = Vec::new();
+//     for chunk in date_cells.chunks(7) { date_rows.push(Row::new(chunk.to_vec())); }
+
+//     TableSelection { items: date_rows, state: TableState::default() }
+//     // TableSelection { items: date_cells, state: TableState::default() }
+// }
+fn calendar_info(date: NaiveDate) -> CalInfo {
+    let date = chrono::Local.ymd(date.year(), date.month(), 1).naive_local();
+    CalInfo::new(date.weekday(), month_in_days(date) as i8)
+}
+
+fn month_in_days(date: NaiveDate) -> u8 {
+    match date.month() {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 =>  return 31,
+        4 | 6 | 9 | 11 => return 30,
+        2 => if date.year() % 4 == 0 { return 29 } else { return 28 }
+        _ => 0
+    }
+}
+
+fn month_string(month_num: u8) -> String {
+    match month_num {
+        1 => "Jan".to_string(),
+        2 => "Feb".to_string(),
+        3 => "Mar".to_string(),
+        4 => "Apr".to_string(),
+        5 => "May".to_string(),
+        6 => "Jun".to_string(),
+        7 => "Jul".to_string(),
+        8 => "Aug".to_string(),
+        9 => "Sep".to_string(),
+        10 => "Oct".to_string(),
+        11 => "Nov".to_string(),
+        12 => "Dec".to_string(),
+        _ => "".to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct CalInfo {
+  weekday: Weekday,
+  length: i8,
+}
+
+impl CalInfo {
+    fn new(weekday: Weekday, length: i8) -> Self {
+        Self{weekday, length}
+    }
+}
